@@ -13,18 +13,32 @@ flowchart LR
     GW --> CON[ms-consulta]
     GW --> AVA[ms-avaliacao]
     GW --> DIE[ms-dieta]
+    GW --> PLA[ms-planos]
+    GW --> PAG[ms-pagamentos]
+    GW --> AUD[ms-auditoria]
+    PSP[Provedor de pagamento] -->|webhook assinado| GW
 
     NUT -. "/internal (Feign)" .-> AUTH
     CON -. "/internal" .-> PAC
     CON -. "/internal" .-> NUT
     AVA -. "/internal" .-> PAC
     DIE -. "/internal" .-> PAC
+    PAC -. "/internal" .-> PLA
+    NUT -. "/internal" .-> PLA
+    PLA -. "/internal" .-> PAG
+    PAG -. "API do provedor" .-> PSP
 
     PAC == "paciente.*" ==> MQ[(RabbitMQ)]
     NUT == "consultorio.*" ==> MQ
+    PLA == "assinatura.*" ==> MQ
+    PAG == "cobranca.*" ==> MQ
     MQ ==> CON
     MQ ==> AVA
     MQ ==> DIE
+    MQ ==> PAC
+    MQ ==> NUT
+    MQ ==> PLA
+    MQ == "auditoria.* (de todos)" ==> AUD
 
     REG[Eureka] -.- GW
 
@@ -35,6 +49,9 @@ flowchart LR
         DB4[(afit_consulta)]
         DB5[(afit_avaliacao)]
         DB6[(afit_dieta)]
+        DB7[(afit_planos)]
+        DB8[(afit_pagamentos)]
+        DB9[(afit_auditoria)]
     end
     AUTH --- DB1
     NUT --- DB2
@@ -42,6 +59,9 @@ flowchart LR
     CON --- DB4
     AVA --- DB5
     DIE --- DB6
+    PLA --- DB7
+    PAG --- DB8
+    AUD --- DB9
 ```
 
 Setas cheias: chamadas HTTP. Pontilhadas: chamadas internas síncronas (só quando necessário). Duplas: eventos.
@@ -58,11 +78,18 @@ Um serviço por contexto de negócio, não por tabela. Cada serviço é o único
 | ms-consulta | 2, 4 | consulta (agenda), análise |
 | ms-avaliacao | 3, 6 | métrica, região corporal, equipamento, avaliação e resultados, meta, exame e resultados, série de evolução |
 | ms-dieta | 5 | grupo alimentar, alimento, medidas caseiras, nutrientes, restrições por condição, dieta, refeição, itens, substitutos |
+| ms-planos | — | catálogo de planos da plataforma, assinatura do nutricionista, faturas |
+| ms-pagamentos | — | cobrança (Pix, boleto, cartão) no provedor de pagamento, notificações do provedor |
+| ms-auditoria | — | trilha de auditoria de todos os serviços |
 
 Duas escolhas de agrupamento:
 
 - **Avaliações e exames juntos.** Os dois usam o mesmo catálogo de métricas, e a tela de evolução mistura os dois (peso e % de gordura ao lado de glicemia e colesterol). Separados, a evolução viraria uma composição entre serviços.
 - **Alimentos e dietas juntos.** Montar e totalizar uma dieta lê a composição dos alimentos o tempo todo. Separados, cada tela de dieta faria dezenas de chamadas remotas.
+
+E uma escolha de separação:
+
+- **Planos e pagamentos separados.** O ms-planos sabe *o que* cobrar (plano, ciclo, período); o ms-pagamentos sabe *como* cobrar (provedor, Pix, boleto, cartão, webhooks). A cobrança só conhece uma origem e uma referência (`ASSINATURA` + id da fatura), então trocar de provedor não mexe em assinatura, e outro produto pode cobrar pelo mesmo serviço.
 
 ## Isolamento entre nutricionistas
 
@@ -81,11 +108,13 @@ O sistema é multi-nutricionista e o **nutricionista é o tenant**.
 | JWT ES256 | Só o ms-autenticacao tem a chave **privada** e emite tokens. Gateway e serviços validam com a **pública**: um serviço comprometido não consegue forjar identidade. |
 | Gateway | Rejeita JWT inválido, devolve 404 para `/{servico}/internal/**` e `/{servico}/actuator/**`, remove headers reservados (`X-Internal-Token`, `X-Afit-*`) e aplica CORS. Não tem nenhum segredo. |
 | Cada serviço | Valida o JWT de novo (`core-web`). Rotas `/v1/**` exigem o papel `NUTRICIONISTA`. |
+| Administração | Rotas `/v1/admin/**` (planos, assinaturas, cobranças, auditoria) exigem o papel `ADMIN`, que nunca é criado por API. |
+| Webhooks | `/ms-pagamentos/v1/webhooks/{provedor}` é público no Gateway; o ms-pagamentos confere a autenticidade do jeito de cada provedor (simulador: HMAC-SHA256 do corpo; Asaas: token no header `asaas-access-token`) e ignora reentregas. O número do cartão é digitado na página do provedor e nunca passa pelo AFitCenter. |
 | Rotas internas | `/internal/**` exigem o `X-Internal-Token`. Um JWT de usuário **nunca** concede acesso interno, e as chamadas Feign levam só o token interno, nunca o JWT do usuário. |
 | Senhas | bcrypt; limite de tentativas por e-mail; e-mail inexistente e senha errada respondem igual, com tempo parecido. |
 | Eureka | Basic auth: ninguém registra instância falsa. |
 | Containers | Cada um recebe só as variáveis que usa; em produção, filesystem só leitura e sem capabilities. |
-| LGPD | Aceite de termos versionado; exclusão lógica de prontuário (consulta, análise, paciente); dados pessoais fora dos logs. |
+| LGPD | Aceite de termos versionado; exclusão lógica de prontuário (consulta, análise, paciente); dados pessoais fora dos logs; trilha de auditoria de acessos e alterações (veja abaixo). |
 
 Erros seguem **Problem Details** (RFC 9457) em todos os serviços e no Gateway: `type`, `title`, `status`, `detail`, `instance`, `timestamp` e, em validação, `erros` por campo.
 
@@ -102,6 +131,9 @@ Usada só quando a resposta é necessária na hora.
 | ms-consulta | `GET /internal/consultorios/{id}` (ms-nutricionista) | Idem, para consultório |
 | ms-avaliacao, ms-dieta (a implementar) | `GET /internal/consultas/{id}` (ms-consulta) | Validar o vínculo com a consulta |
 | ms-dieta (a implementar) | `GET /internal/pacientes/{id}/condicoes-ativas` (ms-paciente) | Alertar alimentos restritos ao montar a dieta |
+| ms-paciente, ms-nutricionista | `GET /internal/assinaturas/{nutricionistaId}` (ms-planos) | Réplica da assinatura ainda vazia (limites do plano) |
+| ms-planos | `POST /internal/cobrancas`, `POST /internal/cobrancas/{id}/cancelamento` (ms-pagamentos) | Cobrar a fatura (idempotente pela chave) e cancelar a cobrança anterior |
+| ms-planos | `GET /internal/nutricionistas/{id}` (ms-nutricionista) | Pagador da cobrança (nome, CPF e e-mail), buscado a cada emissão |
 
 ### Assíncrona: eventos no RabbitMQ
 
@@ -111,6 +143,9 @@ Exchange `afitcenter.eventos` (topic). Cada consumidor tem a própria fila, com 
 | --- | --- | --- |
 | `paciente.criado` / `paciente.atualizado` / `paciente.excluido` | ms-paciente | `ms-consulta.paciente`, `ms-avaliacao.paciente`, `ms-dieta.paciente` |
 | `consultorio.criado` / `consultorio.atualizado` / `consultorio.desativado` | ms-nutricionista | `ms-consulta.consultorio` |
+| `assinatura.criada` / `assinatura.atualizada` | ms-planos | `ms-paciente.assinatura`, `ms-nutricionista.assinatura` |
+| `cobranca.paga` / `.recusada` / `.vencida` / `.cancelada` / `.estornada` | ms-pagamentos | `ms-planos.cobranca` |
+| `auditoria.registro` | todos os serviços | `ms-auditoria.registros` |
 
 - **Outbox:** o evento é gravado na tabela `outbox_evento` na **mesma transação** da alteração. Se a transação falhar, o evento some junto. Um publicador agendado envia os pendentes com `FOR UPDATE SKIP LOCKED` (várias réplicas não duplicam) e só os marca como publicados depois da confirmação do broker.
 - **Entrega "pelo menos uma vez":** o consumidor aplica o evento só se a versão for mais nova que a da réplica. Reentregas e mensagens fora de ordem são ignoradas sem erro.
@@ -165,9 +200,79 @@ sequenceDiagram
 
 Se a própria compensação falhar, fica uma credencial sem perfil (o login funciona, mas as rotas do nutricionista respondem 404) e o erro vai para o log para remoção manual.
 
+### Assinatura da plataforma
+
+Todo nutricionista tem uma assinatura, criada no **plano padrão (gratuito)** na primeira vez que alguém pergunta por ela. Planos limitam o número de **pacientes** (ms-paciente) e de **consultórios ativos** (ms-nutricionista); limite nulo = ilimitado. Os planos iniciais (Gratuito, Profissional, Clínica) estão em `V2__catalogo_planos.sql` e o administrador muda preços e limites em `/v1/admin/planos`.
+
+```mermaid
+sequenceDiagram
+    participant N as Nutricionista
+    participant PL as ms-planos
+    participant NU as ms-nutricionista
+    participant PG as ms-pagamentos
+    participant PR as Provedor
+    participant Q as RabbitMQ
+    participant PA as ms-paciente
+    N->>PL: POST /v1/assinatura/mudanca-plano (Profissional, mensal, Pix)
+    PL->>PL: grava fatura ABERTA
+    PL->>NU: GET /internal/nutricionistas/{id}
+    NU-->>PL: pagador (nome, CPF, e-mail)
+    PL->>PG: POST /internal/cobrancas (chave = fatura:id:tentativa, pagador)
+    PG->>PR: cria a cobrança (referência = id da cobrança)
+    PR-->>PG: Pix copia e cola
+    PG-->>PL: cobrança
+    PL-->>N: fatura + Pix (o plano ainda não mudou)
+    PR->>PG: webhook "pago" (assinado ou com token)
+    PG->>Q: cobranca.paga (outbox)
+    Q->>PL: cobranca.paga
+    PL->>PL: fatura PAGA, novo período começa no pagamento
+    PL->>Q: assinatura.atualizada (limites do Profissional)
+    Q->>PA: assinatura.atualizada
+    PA->>PA: assinatura_ref (limite de pacientes)
+```
+
+- **Limites nos consumidores:** o evento traz os limites **efetivos**, e o ms-paciente e o ms-nutricionista só comparam o uso com eles (`core-assinatura`, tabela `assinatura_ref`, mesma regra de versão das outras réplicas). A linha da réplica é bloqueada (`FOR UPDATE`) na transação da criação, para duas criações simultâneas não passarem juntas do limite. Se a réplica estiver vazia e o ms-planos fora do ar, a criação é **permitida** e o fato vai para o log: um limite comercial não para o atendimento.
+- **Mudança para plano pago:** gera fatura e cobrança; o plano só muda com o pagamento, e o período novo começa nele (sem pró-rata na v1). Uma escolha nova substitui a mudança ainda não paga.
+- **Renovação:** 7 dias antes do fim do período o agendador emite a fatura do período seguinte (preço atual do plano) e a cobrança, com vencimento no último dia pago.
+- **Inadimplência:** o período acaba sem pagamento → `INADIMPLENTE` (limites mantidos) → 7 dias depois, `SUSPENSA` (valem os limites do plano gratuito até o pagamento). Os dados nunca são apagados nem bloqueados para leitura.
+- **Cancelamento:** volta ao gratuito no fim do período pago (na hora, se inadimplente ou suspensa). Pode ser desfeito enquanto o período não acabou.
+- **Estorno** (administrador, em `/ms-pagamentos/v1/admin/cobrancas/{id}/estorno`): o período pago por aquela fatura deixa de valer.
+- **Pagamento atrasado ou duplicado:** Pix vencido pago no último instante é aceito; se a fatura já tinha outra cobrança, a outra é cancelada. Pagamento de fatura cancelada vai para o log e para a trilha, para estorno manual.
+
+**Provedores de pagamento:** o ms-pagamentos fala com o provedor por uma interface (`ProvedorPagamento`), e `afitcenter.pagamentos.provedor` (`AFIT_PAGAMENTOS_PROVEDOR`) escolhe para onde vão as **novas** cobranças. As antigas continuam no provedor em que foram criadas, então o anterior fica habilitado depois da troca.
+
+| Provedor | Como liga | Cobrança | Webhook |
+| --- | --- | --- | --- |
+| `SIMULADO` (padrão) | Sempre disponível | Pix, boleto e página de cartão fictícios; nenhum valor é recebido | HMAC-SHA256 do corpo no header `X-Simulador-Assinatura` |
+| `ASAAS` | `AFIT_PAGAMENTOS_ASAAS_HABILITADO=true`, chave de API e token do webhook | Pix copia e cola, linha digitável do boleto e fatura hospedada (`invoiceUrl`), onde o cartão é digitado | Token cadastrado no painel, no header `asaas-access-token`; o `id` do evento identifica reentregas |
+
+Nos perfis `local` e `homolog`, `POST /ms-pagamentos/v1/simulador/cobrancas/{id}/pagamento` confirma uma cobrança do simulador pelo mesmo caminho do webhook.
+
+No Asaas:
+
+- **Pagador:** o Asaas exige nome e CPF/CNPJ. O ms-planos busca nome, CPF e e-mail no ms-nutricionista a cada emissão e os manda em `pagador`; o ms-pagamentos só os repassa ao provedor, sem gravar. Cada nutricionista vira **um** cliente do Asaas (`externalReference` = id do nutricionista), reaproveitado nas cobranças seguintes e criado com as notificações do Asaas desligadas: o AFitCenter mostra a cobrança, e e-mail e SMS do Asaas são pagos.
+- **Idempotência:** o Asaas não aceita chave de idempotência. A cobrança leva `externalReference` = id da cobrança, e o ms-pagamentos procura por ela antes de criar: repetir depois de um timeout (ou de uma falha ao buscar o QR Code) devolve a mesma cobrança.
+- **Eventos:** `PAYMENT_CONFIRMED` (cartão aprovado) e `PAYMENT_RECEIVED` (Pix, boleto ou cartão liberado) confirmam o pagamento; o que chegar depois do primeiro é ignorado. `PAYMENT_CREDIT_CARD_CAPTURE_REFUSED` e `PAYMENT_REPROVED_BY_RISK_ANALYSIS` recusam, e `PAYMENT_REFUNDED` estorna. Os demais (criada, visualizada, vencida, removida...) só ficam registrados, e chargeback vai para o log, para acompanhar no painel. O vencimento continua decidido pelo agendador do ms-pagamentos.
+- **Cancelamento e estorno:** cancelar remove a cobrança no Asaas (409 se já foi paga). Pix e cartão são estornados pela API. Boleto não: o Asaas pede a conta de devolução ao pagador, então o estorno é feito no painel (a rota responde 422 explicando) e chega pelo webhook `PAYMENT_REFUNDED`.
+- **Resposta do webhook:** sempre **200**, para todos os provedores. O Asaas trata qualquer outro status (inclusive 204) como falha e pausa a fila depois de 15 seguidas.
+- **Ativar:** gere a chave de API no painel (sandbox `https://api-sandbox.asaas.com/v3`, o padrão, ou produção `https://api.asaas.com/v3`; cada chave só vale no seu ambiente). Cadastre o webhook de cobranças para `<gateway>/ms-pagamentos/v1/webhooks/asaas`, com o token de `AFIT_PAGAMENTOS_ASAAS_TOKEN_WEBHOOK` e envio sequencial. Depois habilite o Asaas e troque `AFIT_PAGAMENTOS_PROVEDOR=ASAAS`. Só o container do ms-pagamentos recebe essas variáveis. No `.env`, a chave vai entre aspas simples: ela começa com `$`, e o Compose tentaria expandi-la.
+
+## Trilha de auditoria
+
+Todos os serviços registram **quem fez o quê** e publicam em `auditoria.registro`; o ms-auditoria guarda tudo numa tabela só de inserção.
+
+- **Automática (`core-auditoria`):** cada requisição `/v1/**` que chega a um controller gera um registro com método, padrão da rota (`/v1/consultas/{id}/status`), variáveis da rota, status da resposta, usuário, papel, tenant e IP. O recurso é a raiz do agregado na rota (`consultas`) e o id vem da rota ou da resposta; o paciente vem de `pacienteId` na rota ou na resposta.
+- **Leituras de prontuário:** `afitcenter.auditoria.leituras=true` no ms-paciente, ms-consulta, ms-avaliacao e ms-dieta registra também os `GET` (LGPD: quem acessou os dados de saúde de um paciente). Catálogos sem dado pessoal (alimentos, métricas, condições) ficam de fora.
+- **Ações do sistema:** renovação, inadimplência, pagamento confirmado e mudanças de cobrança são registradas pelo próprio serviço (`Auditoria.registrarSistema`), na mesma transação da mudança.
+- **Sem dados pessoais:** corpo e query string nunca entram no registro (podem ter nome, CPF ou conteúdo clínico); login registra o usuário, nunca o e-mail.
+- **Entrega:** o registro vai para a outbox numa transação própria logo depois da resposta. A outbox apaga os eventos já publicados depois de 7 dias (`afitcenter.outbox.retencao-horas`).
+- **Guarda:** o id do registro é o id do evento (reentrega não duplica). Um gatilho do banco recusa `UPDATE`, `DELETE` e `TRUNCATE`; só a retenção diária apaga registros mais antigos que `AUDITORIA_RETENCAO_DIAS` (padrão 5 anos).
+- **Consulta:** o nutricionista vê o próprio tenant em `/ms-auditoria/v1/auditoria/registros` (filtro `pacienteId` responde "quem acessou este paciente"; o IP só aparece nos registros feitos por ele). O administrador vê todos em `/v1/admin/auditoria/registros`, e cada consulta dele também entra na trilha.
+- **Fora da trilha:** requisições recusadas pelo filtro de segurança antes do controller (401 de token inválido), que o Gateway já barra.
+
 ## Dados
 
-- **Um banco por serviço**, no mesmo PostgreSQL, cada um com usuário próprio que só acessa o seu banco. Nenhum serviço lê o banco de outro.
+- **Um banco por serviço** (nove), no mesmo PostgreSQL, cada um com usuário próprio que só acessa o seu banco. Nenhum serviço lê o banco de outro.
 - **Migrações Flyway por serviço:** `db/migration/common` (todos os ambientes, incluindo os catálogos) e `db/migration/local` (dados fictícios, só no perfil `local`). O Hibernate só valida (`ddl-auto=validate`).
 - **Versão** (`@Version`) nas tabelas que publicam eventos: bloqueio otimista (409 em edição simultânea) e ordem dos eventos nas réplicas.
 - **Exclusão lógica** (`deletado_em`) em paciente, consulta, análise, avaliação, exame e dieta. Auditoria (`criado_em`, `atualizado_em`) em todas as tabelas de cadastro.
@@ -193,6 +298,9 @@ O [MER](MER.md) continua sendo o modelo lógico. Na divisão física por serviç
 
 | Item | Onde |
 | --- | --- |
+| Validar o Asaas no sandbox com credenciais reais (hoje testado só contra um servidor que imita a API) e ativá-lo em produção | ms-pagamentos |
+| Pró-rata na mudança de plano, período de teste, aviso de vencimento por e-mail | ms-planos |
+| Emissão de nota fiscal de serviço das faturas pagas | ms-planos + integração |
 | CRUD de avaliações (com resultados), metas, exames (com anexos e resultados), evolução e comparação | ms-avaliacao |
 | CRUD de alimentos próprios e medidas, dietas, refeições, itens e substitutos, modelos e versões, totais, alertas de restrição | ms-dieta |
 | Importar a TACO/TBCA como migração do catálogo de alimentos | ms-dieta |
