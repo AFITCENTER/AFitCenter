@@ -140,7 +140,7 @@ O sistema é multi-nutricionista e o **nutricionista é o tenant**.
 | Gateway | Rejeita JWT inválido, devolve 404 para `/{servico}/internal/**` e `/{servico}/actuator/**`, remove headers reservados (`X-Internal-Token`, `X-Afit-*`) e aplica CORS. Não tem nenhum segredo. |
 | Cada serviço | Valida o JWT de novo (`core-web`). Rotas `/v1/**` exigem o papel `NUTRICIONISTA`. |
 | Administração | Rotas `/v1/admin/**` (planos, assinaturas, cobranças, auditoria) exigem o papel `ADMIN`, que nunca é criado por API. |
-| Webhooks | `/ms-pagamentos/v1/webhooks/{provedor}` é público no Gateway; o ms-pagamentos confere a assinatura de cada provedor (simulador: HMAC-SHA256) e ignora reentregas. O número do cartão é digitado na página do provedor e nunca passa pelo AFitCenter. |
+| Webhooks | `/ms-pagamentos/v1/webhooks/{provedor}` é público no Gateway; o ms-pagamentos confere a autenticidade do jeito de cada provedor (simulador: HMAC-SHA256 do corpo; Asaas: token no header `asaas-access-token`) e ignora reentregas. O número do cartão é digitado na página do provedor e nunca passa pelo AFitCenter. |
 | Rotas internas | `/internal/**` exigem o `X-Internal-Token`. Um JWT de usuário **nunca** concede acesso interno, e as chamadas Feign levam só o token interno, nunca o JWT do usuário. |
 | Senhas | bcrypt; limite de tentativas por e-mail; e-mail inexistente e senha errada respondem igual, com tempo parecido. |
 | Eureka | Basic auth: ninguém registra instância falsa. |
@@ -164,6 +164,7 @@ Usada só quando a resposta é necessária na hora.
 | ms-dieta (a implementar) | `GET /internal/pacientes/{id}/condicoes-ativas` (ms-paciente) | Alertar alimentos restritos ao montar a dieta |
 | ms-paciente, ms-nutricionista | `GET /internal/assinaturas/{nutricionistaId}` (ms-planos) | Réplica da assinatura ainda vazia (limites do plano) |
 | ms-planos | `POST /internal/cobrancas`, `POST /internal/cobrancas/{id}/cancelamento` (ms-pagamentos) | Cobrar a fatura (idempotente pela chave) e cancelar a cobrança anterior |
+| ms-planos | `GET /internal/nutricionistas/{id}` (ms-nutricionista) | Pagador da cobrança (nome, CPF e e-mail), buscado a cada emissão |
 
 ### Assíncrona: eventos no RabbitMQ
 
@@ -238,18 +239,21 @@ Todo nutricionista tem uma assinatura, criada no **plano padrão (gratuito)** na
 sequenceDiagram
     participant N as Nutricionista
     participant PL as ms-planos
+    participant NU as ms-nutricionista
     participant PG as ms-pagamentos
     participant PR as Provedor
     participant Q as RabbitMQ
     participant PA as ms-paciente
     N->>PL: POST /v1/assinatura/mudanca-plano (Profissional, mensal, Pix)
     PL->>PL: grava fatura ABERTA
-    PL->>PG: POST /internal/cobrancas (chave = fatura:id:tentativa)
-    PG->>PR: cria a cobrança
+    PL->>NU: GET /internal/nutricionistas/{id}
+    NU-->>PL: pagador (nome, CPF, e-mail)
+    PL->>PG: POST /internal/cobrancas (chave = fatura:id:tentativa, pagador)
+    PG->>PR: cria a cobrança (referência = id da cobrança)
     PR-->>PG: Pix copia e cola
     PG-->>PL: cobrança
     PL-->>N: fatura + Pix (o plano ainda não mudou)
-    PR->>PG: webhook "pago" (assinado)
+    PR->>PG: webhook "pago" (assinado ou com token)
     PG->>Q: cobranca.paga (outbox)
     Q->>PL: cobranca.paga
     PL->>PL: fatura PAGA, novo período começa no pagamento
@@ -266,7 +270,23 @@ sequenceDiagram
 - **Estorno** (administrador, em `/ms-pagamentos/v1/admin/cobrancas/{id}/estorno`): o período pago por aquela fatura deixa de valer.
 - **Pagamento atrasado ou duplicado:** Pix vencido pago no último instante é aceito; se a fatura já tinha outra cobrança, a outra é cancelada. Pagamento de fatura cancelada vai para o log e para a trilha, para estorno manual.
 
-**Provedor de pagamento:** o ms-pagamentos fala com o provedor por uma interface (`ProvedorPagamento`). Hoje só existe o **simulador** (`afitcenter.pagamentos.provedor=SIMULADO`): devolve Pix, boleto e página de cartão fictícios e aceita notificações assinadas com HMAC. Nos perfis `local` e `homolog`, `POST /ms-pagamentos/v1/simulador/cobrancas/{id}/pagamento` confirma uma cobrança pelo mesmo caminho do webhook. Para cobrar de verdade, implemente `ProvedorPagamento` para o provedor escolhido (Asaas, Mercado Pago, Stripe...) e troque a propriedade; cobranças antigas continuam no provedor em que foram criadas.
+**Provedores de pagamento:** o ms-pagamentos fala com o provedor por uma interface (`ProvedorPagamento`), e `afitcenter.pagamentos.provedor` (`AFIT_PAGAMENTOS_PROVEDOR`) escolhe para onde vão as **novas** cobranças. As antigas continuam no provedor em que foram criadas, então o anterior fica habilitado depois da troca.
+
+| Provedor | Como liga | Cobrança | Webhook |
+| --- | --- | --- | --- |
+| `SIMULADO` (padrão) | Sempre disponível | Pix, boleto e página de cartão fictícios; nenhum valor é recebido | HMAC-SHA256 do corpo no header `X-Simulador-Assinatura` |
+| `ASAAS` | `AFIT_PAGAMENTOS_ASAAS_HABILITADO=true`, chave de API e token do webhook | Pix copia e cola, linha digitável do boleto e fatura hospedada (`invoiceUrl`), onde o cartão é digitado | Token cadastrado no painel, no header `asaas-access-token`; o `id` do evento identifica reentregas |
+
+Nos perfis `local` e `homolog`, `POST /ms-pagamentos/v1/simulador/cobrancas/{id}/pagamento` confirma uma cobrança do simulador pelo mesmo caminho do webhook.
+
+No Asaas:
+
+- **Pagador:** o Asaas exige nome e CPF/CNPJ. O ms-planos busca nome, CPF e e-mail no ms-nutricionista a cada emissão e os manda em `pagador`; o ms-pagamentos só os repassa ao provedor, sem gravar. Cada nutricionista vira **um** cliente do Asaas (`externalReference` = id do nutricionista), reaproveitado nas cobranças seguintes e criado com as notificações do Asaas desligadas: o AFitCenter mostra a cobrança, e e-mail e SMS do Asaas são pagos.
+- **Idempotência:** o Asaas não aceita chave de idempotência. A cobrança leva `externalReference` = id da cobrança, e o ms-pagamentos procura por ela antes de criar: repetir depois de um timeout (ou de uma falha ao buscar o QR Code) devolve a mesma cobrança.
+- **Eventos:** `PAYMENT_CONFIRMED` (cartão aprovado) e `PAYMENT_RECEIVED` (Pix, boleto ou cartão liberado) confirmam o pagamento; o que chegar depois do primeiro é ignorado. `PAYMENT_CREDIT_CARD_CAPTURE_REFUSED` e `PAYMENT_REPROVED_BY_RISK_ANALYSIS` recusam, e `PAYMENT_REFUNDED` estorna. Os demais (criada, visualizada, vencida, removida...) só ficam registrados, e chargeback vai para o log, para acompanhar no painel. O vencimento continua decidido pelo agendador do ms-pagamentos.
+- **Cancelamento e estorno:** cancelar remove a cobrança no Asaas (409 se já foi paga). Pix e cartão são estornados pela API. Boleto não: o Asaas pede a conta de devolução ao pagador, então o estorno é feito no painel (a rota responde 422 explicando) e chega pelo webhook `PAYMENT_REFUNDED`.
+- **Resposta do webhook:** sempre **200**, para todos os provedores. O Asaas trata qualquer outro status (inclusive 204) como falha e pausa a fila depois de 15 seguidas.
+- **Ativar:** gere a chave de API no painel (sandbox `https://api-sandbox.asaas.com/v3`, o padrão, ou produção `https://api.asaas.com/v3`; cada chave só vale no seu ambiente). Cadastre o webhook de cobranças para `<gateway>/ms-pagamentos/v1/webhooks/asaas`, com o token de `AFIT_PAGAMENTOS_ASAAS_TOKEN_WEBHOOK` e envio sequencial. Depois habilite o Asaas e troque `AFIT_PAGAMENTOS_PROVEDOR=ASAAS`. Só o container do ms-pagamentos recebe essas variáveis. No `.env`, a chave vai entre aspas simples: ela começa com `$`, e o Compose tentaria expandi-la.
 
 ## Trilha de auditoria
 
@@ -309,7 +329,7 @@ O [MER](MER.md) continua sendo o modelo lógico. Na divisão física por serviç
 
 | Item | Onde |
 | --- | --- |
-| Integrar um provedor de pagamento real (implementar `ProvedorPagamento`) | ms-pagamentos |
+| Validar o Asaas no sandbox com credenciais reais (hoje testado só contra um servidor que imita a API) e ativá-lo em produção | ms-pagamentos |
 | Pró-rata na mudança de plano, período de teste, aviso de vencimento por e-mail | ms-planos |
 | Emissão de nota fiscal de serviço das faturas pagas | ms-planos + integração |
 | CRUD de avaliações (com resultados), metas, exames (com anexos e resultados), evolução e comparação | ms-avaliacao |
