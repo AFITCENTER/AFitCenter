@@ -6,7 +6,7 @@
 |---|---|
 | Vários nutricionistas, cada um com seus pacientes | O nutricionista é o *tenant*. Cada um tem a **própria ficha** do paciente; a mesma pessoa pode ter fichas em vários nutricionistas, isoladas entre si. CPF é único **por nutricionista**. |
 | Estudante fora da v1 | Entidade removida (volta depois como papel ligado a um nutricionista supervisor). |
-| Paciente sem acesso na v1, com acesso no futuro | `paciente.usuario_id` já existe (opcional). No futuro, um único login de paciente enxerga todas as fichas dele, uma por nutricionista. |
+| Nutricionistas e pacientes acessam o sistema | `PESSOA` é quem acessa: nome, CPF, e-mail (login), telefone, senha e um ou mais papéis (`PESSOA_PAPEL`). O nutricionista é o perfil profissional da pessoa (mesmo id). O paciente cria a própria conta e liga as fichas com o código de acesso que o nutricionista gera: um login enxerga todas as fichas dele, uma por nutricionista (`paciente.pessoa_id`). |
 
 ## Convenções
 
@@ -22,9 +22,12 @@
 
 ```mermaid
 erDiagram
-    USUARIO ||--o| NUTRICIONISTA : "acessa como"
-    USUARIO |o--o{ PACIENTE : "acessa (futuro)"
-    USUARIO ||--o{ ACEITE_TERMO : aceita
+    PESSOA ||--|{ PESSOA_PAPEL : "tem papel"
+    PESSOA ||--o| NUTRICIONISTA : "atua como"
+    PESSOA |o--o{ PACIENTE : "acessa a ficha"
+    PESSOA ||--o{ ACEITE_TERMO : aceita
+    PESSOA ||--o{ TOKEN_EMAIL : "recebe link"
+    PACIENTE ||--o| CODIGO_ACESSO : "libera com"
     NUTRICIONISTA ||--o{ CONSULTORIO : possui
     NUTRICIONISTA ||--o{ PACIENTE : atende
     NUTRICIONISTA ||--o{ CONSULTA : realiza
@@ -58,41 +61,57 @@ erDiagram
 
 ## 1. Acesso e cadastro (requisitos 1 e 7)
 
+Uma conta por pessoa, com um ou mais papéis: a nutricionista que também é paciente de um colega usa o mesmo login. Os dados pessoais ficam na pessoa; o nutricionista guarda só o perfil profissional, com o mesmo id.
+
 ```mermaid
 erDiagram
-    USUARIO ||--o| NUTRICIONISTA : "acessa como"
-    USUARIO |o--o{ PACIENTE : "acessa (futuro)"
-    USUARIO ||--o{ ACEITE_TERMO : aceita
+    PESSOA ||--|{ PESSOA_PAPEL : "tem papel"
+    PESSOA ||--o| NUTRICIONISTA : "atua como"
+    PESSOA |o--o{ PACIENTE : "acessa a ficha"
+    PESSOA ||--o{ ACEITE_TERMO : aceita
+    PESSOA ||--o{ TOKEN_EMAIL : "recebe link"
+    PACIENTE ||--o| CODIGO_ACESSO : "libera com"
     NUTRICIONISTA ||--o{ CONSULTORIO : possui
     NUTRICIONISTA ||--o{ PACIENTE : atende
-    NUTRICIONISTA |o--o| ENDERECO : "mora em"
+    NUTRICIONISTA |o--o| ENDERECO : "atende em"
     CONSULTORIO |o--o| ENDERECO : "fica em"
     PACIENTE |o--o| ENDERECO : "mora em"
     NUTRICIONISTA ||--o{ CONTATO : tem
     PACIENTE ||--o{ CONTATO : tem
     CONSULTORIO ||--o{ CONTATO : tem
 
-    USUARIO {
-        uuid id PK
+    PESSOA {
+        uuid id PK "sub do JWT"
+        text nome
+        char cpf UK "opcional para paciente"
         text email UK "login, case-insensitive"
-        text senha_hash "bcrypt ou argon2"
-        text perfil "NUTRICIONISTA, PACIENTE, ADMIN"
+        timestamptz email_confirmado_em "o login não exige"
+        text telefone
+        text senha_hash "bcrypt"
         text status "ATIVO, BLOQUEADO, INATIVO"
         timestamptz ultimo_acesso
     }
+    PESSOA_PAPEL {
+        uuid pessoa_id PK, FK
+        text papel PK "NUTRICIONISTA, PACIENTE, ADMIN"
+    }
+    TOKEN_EMAIL {
+        uuid id PK
+        uuid pessoa_id FK
+        text finalidade "REDEFINICAO_SENHA, CONFIRMACAO_EMAIL"
+        text token_hash UK "SHA-256 do token do link"
+        timestamptz expira_em "uso único, 30 min ou 48 h"
+    }
     ACEITE_TERMO {
         uuid id PK
-        uuid usuario_id FK
+        uuid pessoa_id FK
         text tipo "TERMOS_DE_USO, POLITICA_PRIVACIDADE"
         text versao
         timestamptz aceito_em
         inet ip
     }
     NUTRICIONISTA {
-        uuid id PK
-        uuid usuario_id FK, UK
-        text nome
-        char cpf UK
+        uuid id PK, FK "= pessoa.id"
         smallint crn_regiao "CRN-3 = 3"
         text crn_numero "único por região"
         text especialidades
@@ -110,7 +129,8 @@ erDiagram
     PACIENTE {
         uuid id PK
         uuid nutricionista_id FK "dono da ficha"
-        uuid usuario_id FK "nulo na v1"
+        uuid pessoa_id FK "conta no portal, nulo = sem acesso"
+        timestamptz pessoa_vinculada_em
         text nome
         text nome_social
         char cpf "único por nutricionista"
@@ -121,6 +141,11 @@ erDiagram
         text nivel_atividade "SEDENTARIO a MUITO_INTENSO"
         text status "ATIVO, INATIVO"
         uuid endereco_id FK
+    }
+    CODIGO_ACESSO {
+        uuid paciente_id PK, FK
+        text codigo_hash UK "SHA-256 do código"
+        timestamptz expira_em "uso único"
     }
     ENDERECO {
         uuid id PK

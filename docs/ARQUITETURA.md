@@ -7,7 +7,7 @@ Microsserviços Spring Boot atrás de um API Gateway, com descoberta via Eureka,
 ```mermaid
 flowchart LR
     FE[Frontend] -->|HTTPS + JWT| GW[Gateway]
-    GW --> AUTH[ms-autenticacao]
+    GW --> PES[ms-pessoa]
     GW --> NUT[ms-nutricionista]
     GW --> PAC[ms-paciente]
     GW --> CON[ms-consulta]
@@ -18,13 +18,14 @@ flowchart LR
     GW --> AUD[ms-auditoria]
     PSP[Provedor de pagamento] -->|webhook assinado| GW
 
-    NUT -. "/internal (Feign)" .-> AUTH
+    NUT -. "/internal (Feign)" .-> PES
     CON -. "/internal" .-> PAC
     CON -. "/internal" .-> NUT
     AVA -. "/internal" .-> PAC
     DIE -. "/internal" .-> PAC
     PAC -. "/internal" .-> PLA
     NUT -. "/internal" .-> PLA
+    PLA -. "/internal" .-> PES
     PLA -. "/internal" .-> PAG
     PAG -. "API do provedor" .-> PSP
 
@@ -43,7 +44,7 @@ flowchart LR
     REG[Eureka] -.- GW
 
     subgraph PG[PostgreSQL]
-        DB1[(afit_auth)]
+        DB1[(afit_pessoa)]
         DB2[(afit_nutricionista)]
         DB3[(afit_paciente)]
         DB4[(afit_consulta)]
@@ -53,7 +54,7 @@ flowchart LR
         DB8[(afit_pagamentos)]
         DB9[(afit_auditoria)]
     end
-    AUTH --- DB1
+    PES --- DB1
     NUT --- DB2
     PAC --- DB3
     CON --- DB4
@@ -72,9 +73,9 @@ Um serviço por contexto de negócio, não por tabela. Cada serviço é o único
 
 | Serviço | Requisitos | Dono de |
 | --- | --- | --- |
-| ms-autenticacao | — | usuário (credencial), aceite de termos |
-| ms-nutricionista | 7 | nutricionista, consultório |
-| ms-paciente | 1 | paciente, contatos, catálogo de condições, condições do paciente, medicamentos |
+| ms-pessoa | — | pessoa (nome, CPF, e-mail, telefone), credencial, papéis, aceite de termos, links por e-mail (redefinição de senha, confirmação do e-mail) |
+| ms-nutricionista | 7 | perfil profissional do nutricionista (CRN, especialidades, logo, endereço), consultório |
+| ms-paciente | 1 | paciente, contatos, catálogo de condições, condições do paciente, medicamentos, código de acesso ao portal |
 | ms-consulta | 2, 4 | consulta (agenda), análise |
 | ms-avaliacao | 3, 6 | métrica, região corporal, equipamento, avaliação e resultados, meta, exame e resultados, série de evolução |
 | ms-dieta | 5 | grupo alimentar, alimento, medidas caseiras, nutrientes, restrições por condição, dieta, refeição, itens, substitutos |
@@ -87,31 +88,35 @@ Duas escolhas de agrupamento:
 - **Avaliações e exames juntos.** Os dois usam o mesmo catálogo de métricas, e a tela de evolução mistura os dois (peso e % de gordura ao lado de glicemia e colesterol). Separados, a evolução viraria uma composição entre serviços.
 - **Alimentos e dietas juntos.** Montar e totalizar uma dieta lê a composição dos alimentos o tempo todo. Separados, cada tela de dieta faria dezenas de chamadas remotas.
 
-E uma escolha de separação:
+E duas escolhas de separação:
 
+- **Pessoa separada dos papéis.** O ms-pessoa sabe *quem* acessa (uma conta por pessoa: um e-mail, um CPF, uma senha); o ms-nutricionista e o ms-paciente sabem *o que* cada papel faz. Uma pessoa pode ter vários papéis (`pessoa_papel`): a nutricionista que também é paciente de um colega entra com o mesmo e-mail e senha, e o token traz os dois papéis.
 - **Planos e pagamentos separados.** O ms-planos sabe *o que* cobrar (plano, ciclo, período); o ms-pagamentos sabe *como* cobrar (provedor, Pix, boleto, cartão, webhooks). A cobrança só conhece uma origem e uma referência (`ASSINATURA` + id da fatura), então trocar de provedor não mexe em assinatura, e outro produto pode cobrar pelo mesmo serviço.
 
 ## Isolamento entre nutricionistas
 
 O sistema é multi-nutricionista e o **nutricionista é o tenant**.
 
-- O perfil do nutricionista tem o **mesmo UUID** do usuário no ms-autenticacao. O JWT carrega esse id (`sub`) e o papel (`roles`), e o tenant sai direto do token: `UsuarioAutenticado.nutricionistaId()`.
+- O perfil do nutricionista tem o **mesmo UUID** da pessoa no ms-pessoa. O JWT carrega esse id (`sub`) e os papéis (`roles`), e o tenant sai direto do token: `UsuarioAutenticado.nutricionistaId()`.
 - Toda tabela raiz (paciente, consulta, avaliação, exame, meta, dieta) tem `nutricionista_id`, e todo acesso filtra por ele. Recurso de outro nutricionista responde **404**, para não revelar que existe.
 - Cada nutricionista tem a **própria ficha** do paciente. A mesma pessoa atendida por dois nutricionistas tem duas fichas independentes: CPF único **por nutricionista** (índice parcial), e o "CPF já cadastrado" de um nunca revela pacientes do outro.
 - Nos serviços consumidores, as **FKs compostas** `(paciente_id, nutricionista_id) → paciente_ref (id, nutricionista_id)` fazem o próprio banco recusar uma consulta, avaliação ou dieta que misture paciente e nutricionista diferentes.
-- **Portal do paciente (futuro):** `paciente.usuario_id` e o papel `PACIENTE` já existem. Um único login de paciente vai enxergar todas as fichas ligadas a ele, uma por nutricionista.
+- **Portal do paciente:** o isolamento é por conta, não por tenant. `/ms-paciente/v1/portal/**` exige o papel `PACIENTE` e só devolve fichas com `paciente.pessoa_id` igual ao `sub` do token. Uma conta liga no máximo uma ficha por nutricionista, e só com o código de acesso que ele gerou ([fluxo](#acesso-do-paciente-portal)).
 
 ## Segurança
 
 | Camada | O que faz |
 | --- | --- |
-| JWT ES256 | Só o ms-autenticacao tem a chave **privada** e emite tokens. Gateway e serviços validam com a **pública**: um serviço comprometido não consegue forjar identidade. |
+| JWT ES256 | Só o ms-pessoa tem a chave **privada** e emite tokens. Gateway e serviços validam com a **pública**: um serviço comprometido não consegue forjar identidade. |
 | Gateway | Rejeita JWT inválido, devolve 404 para `/{servico}/internal/**` e `/{servico}/actuator/**`, remove headers reservados (`X-Internal-Token`, `X-Afit-*`) e aplica CORS. Não tem nenhum segredo. |
-| Cada serviço | Valida o JWT de novo (`core-web`). Rotas `/v1/**` exigem o papel `NUTRICIONISTA`. |
+| Cada serviço | Valida o JWT de novo (`core-web`). Rotas `/v1/**` exigem o papel `NUTRICIONISTA`; as exceções são a conta no ms-pessoa (`/v1/conta`, qualquer papel) e o portal no ms-paciente (`/v1/portal/**`, papel `PACIENTE`). |
 | Administração | Rotas `/v1/admin/**` (planos, assinaturas, cobranças, auditoria) exigem o papel `ADMIN`, que nunca é criado por API. |
 | Webhooks | `/ms-pagamentos/v1/webhooks/{provedor}` é público no Gateway; o ms-pagamentos confere a autenticidade do jeito de cada provedor (simulador: HMAC-SHA256 do corpo; Asaas: token no header `asaas-access-token`) e ignora reentregas. O número do cartão é digitado na página do provedor e nunca passa pelo AFitCenter. |
 | Rotas internas | `/internal/**` exigem o `X-Internal-Token`. Um JWT de usuário **nunca** concede acesso interno, e as chamadas Feign levam só o token interno, nunca o JWT do usuário. |
-| Senhas | bcrypt; limite de tentativas por e-mail; e-mail inexistente e senha errada respondem igual, com tempo parecido. |
+| Senhas | bcrypt; limite de tentativas por e-mail; e-mail inexistente e senha errada respondem igual, com tempo parecido. O cadastro numa conta que já existe confere a senha e conta no mesmo limite do login. Recuperação por e-mail em `/v1/senha/esqueci` e `/v1/senha/redefinir` ([fluxo](#recuperação-de-senha-e-confirmação-do-e-mail)). |
+| Links por e-mail | Redefinição de senha (vale 30 min, `AFIT_SENHA_LINK_VALIDADE_MINUTOS`) e confirmação do e-mail (48 h). Token de 256 bits, uso único; pedir outro invalida o anterior; o banco guarda só o SHA-256 (`token_email`). O token vai no fragmento do link (`#token=`), que não chega a servidor nem a log de acesso, e volta no corpo do POST. "Esqueci a senha" responde sempre 202, exista ou não a conta, e o e-mail sai depois do commit, numa thread à parte. Pedidos de e-mail contam num limite por endereço (5 por hora, 429), exista ou não a conta. |
+| E-mail | O ms-pessoa envia por uma interface (`ProvedorEmail`): `LOG` não envia nada, só registra no log (padrão nos perfis `local` e `homolog`; o token inteiro só aparece no `local`); `SMTP` envia pelo servidor de `AFIT_SMTP_*` (padrão nos demais perfis, que não sobem sem servidor e remetente). Só o container do ms-pessoa recebe as credenciais SMTP. |
+| Código de acesso | 8 caracteres sem 0/O e 1/I (40 bits), uso único, vale 72 h (`PORTAL_CODIGO_VALIDADE_HORAS`); o banco guarda só o SHA-256. Códigos errados contam num limite por conta (429). |
 | Eureka | Basic auth: ninguém registra instância falsa. |
 | Containers | Cada um recebe só as variáveis que usa; em produção, filesystem só leitura e sem capabilities. |
 | LGPD | Aceite de termos versionado; exclusão lógica de prontuário (consulta, análise, paciente); dados pessoais fora dos logs; trilha de auditoria de acessos e alterações (veja abaixo). |
@@ -126,14 +131,14 @@ Usada só quando a resposta é necessária na hora.
 
 | Quem chama | Rota | Para quê |
 | --- | --- | --- |
-| ms-nutricionista | `POST /internal/usuarios`, `DELETE /internal/usuarios/{id}` (ms-autenticacao) | Cadastro: cria a credencial; desfaz se o perfil falhar |
+| ms-nutricionista | `POST /internal/pessoas`, `DELETE /internal/pessoas/{id}/papeis/{papel}` (ms-pessoa) | Cadastro: cria a pessoa (ou acrescenta o papel à conta do e-mail); desfaz se o perfil falhar |
 | ms-consulta, ms-avaliacao, ms-dieta | `GET /internal/pacientes/{id}` (ms-paciente) | Réplica ainda sem o paciente (evento não chegou) |
 | ms-consulta | `GET /internal/consultorios/{id}` (ms-nutricionista) | Idem, para consultório |
 | ms-avaliacao, ms-dieta (a implementar) | `GET /internal/consultas/{id}` (ms-consulta) | Validar o vínculo com a consulta |
 | ms-dieta (a implementar) | `GET /internal/pacientes/{id}/condicoes-ativas` (ms-paciente) | Alertar alimentos restritos ao montar a dieta |
 | ms-paciente, ms-nutricionista | `GET /internal/assinaturas/{nutricionistaId}` (ms-planos) | Réplica da assinatura ainda vazia (limites do plano) |
 | ms-planos | `POST /internal/cobrancas`, `POST /internal/cobrancas/{id}/cancelamento` (ms-pagamentos) | Cobrar a fatura (idempotente pela chave) e cancelar a cobrança anterior |
-| ms-planos | `GET /internal/nutricionistas/{id}` (ms-nutricionista) | Pagador da cobrança (nome, CPF e e-mail), buscado a cada emissão |
+| ms-planos | `GET /internal/pessoas/{id}` (ms-pessoa) | Pagador da cobrança (nome, CPF e e-mail), buscado a cada emissão |
 
 ### Assíncrona: eventos no RabbitMQ
 
@@ -182,23 +187,93 @@ A réplica guarda só o necessário (nome, sexo, nascimento, status, se foi excl
 sequenceDiagram
     participant F as Frontend
     participant N as ms-nutricionista
-    participant A as ms-autenticacao
+    participant P as ms-pessoa
     F->>N: POST /v1/cadastros (público)
-    N->>N: CPF e CRN livres?
-    N->>A: POST /internal/usuarios
-    A-->>N: id do usuário
-    N->>N: grava perfil com o MESMO id
+    N->>N: CRN livre?
+    N->>P: POST /internal/pessoas (nome, CPF, e-mail, senha, papel NUTRICIONISTA)
+    P->>P: e-mail novo cria a pessoa, e-mail com conta e senha certa ganha o papel
+    P-->>N: id da pessoa
+    N->>N: grava perfil profissional com o MESMO id
     alt falhou ao gravar o perfil
-        N->>A: DELETE /internal/usuarios/{id}
+        N->>P: DELETE /internal/pessoas/{id}/papeis/NUTRICIONISTA
         N-->>F: 409
     else sucesso
         N-->>F: 201 { nutricionistaId }
     end
-    F->>A: POST /v1/auth/login
-    A-->>F: JWT (sub = nutricionistaId, roles = [NUTRICIONISTA])
+    F->>P: POST /v1/auth/login
+    P-->>F: JWT (sub = nutricionistaId, roles = [NUTRICIONISTA])
 ```
 
-Se a própria compensação falhar, fica uma credencial sem perfil (o login funciona, mas as rotas do nutricionista respondem 404) e o erro vai para o log para remoção manual.
+- As recusas do ms-pessoa (CPF de outra conta, e-mail com outra senha, conta que já é de nutricionista, 429 de senhas erradas) chegam ao frontend com o motivo original.
+- A compensação tira só o papel; a conta é removida apenas se ficar sem nenhum (foi criada por este cadastro). Quem já era paciente continua paciente.
+- Se a própria compensação falhar, fica uma conta com o papel `NUTRICIONISTA` e sem perfil (o login funciona, mas as rotas do nutricionista respondem 404) e o erro vai para o log para ajuste manual.
+
+### Acesso do paciente (portal)
+
+O paciente cria a própria conta no ms-pessoa e liga a ela as fichas que os nutricionistas liberarem, com um código que cada nutricionista gera e entrega.
+
+```mermaid
+sequenceDiagram
+    participant P as Paciente
+    participant PE as ms-pessoa
+    participant N as Nutricionista
+    participant PA as ms-paciente
+    P->>PE: POST /v1/cadastros/paciente (público)
+    PE-->>P: 201 { pessoaId }
+    N->>PA: POST /v1/pacientes/{id}/acesso
+    PA-->>N: código ABCD-EFGH (vale 72 h)
+    N-->>P: entrega o código (na consulta, por mensagem...)
+    P->>PE: POST /v1/auth/login
+    PE-->>P: JWT (roles = [PACIENTE])
+    P->>PA: POST /v1/portal/vinculos { codigo }
+    PA->>PA: confere hash e validade, grava paciente.pessoa_id
+    PA-->>P: 201 ficha
+    P->>PA: GET /v1/portal/fichas
+```
+
+- **Nenhuma ficha é ligada só por CPF ou e-mail.** Quem decide quem vê a ficha é o nutricionista, ao entregar o código. O CPF no cadastro do paciente é opcional (menores de idade, por exemplo).
+- **Conta que já existe:** a nutricionista que é paciente de um colega se cadastra como paciente com o mesmo e-mail e senha; a conta ganha o papel `PACIENTE` e o próximo login traz os dois papéis.
+- **Uma ficha por nutricionista** em cada conta. Ficha já ligada não gera outro código: o nutricionista desfaz o acesso (`DELETE /v1/pacientes/{id}/acesso`) e gera de novo. Gerar outro código invalida o anterior; excluir a ficha também.
+- **O que o paciente vê:** só a identificação da ficha (nome de exibição, nutricionista, situação). Observações e dados clínicos ficam de fora até o portal ganhar as próprias telas.
+- **Trilha:** a ligação entra na trilha do nutricionista (com o paciente e a conta); o código nunca é registrado.
+
+### Recuperação de senha e confirmação do e-mail
+
+O ms-pessoa manda dois tipos de link por e-mail. O frontend tem as duas páginas (`/redefinir-senha` e `/confirmar-email`, em `AFIT_FRONTEND_URL`), lê o token do fragmento e o envia no corpo:
+
+| Rota (pelo Gateway: `/ms-pessoa/...`) | Acesso | Resposta |
+| --- | --- | --- |
+| `POST /v1/senha/esqueci { email }` | público | **202** sempre, sem corpo; 429 depois de 5 pedidos por hora para o endereço |
+| `POST /v1/senha/redefinir { token, novaSenha }` | público | 204; 422 se o link é inválido, já foi usado ou venceu |
+| `POST /v1/conta/email/confirmacao { token }` | público (o token identifica a conta) | 204; 422 como acima |
+| `POST /v1/conta/email/confirmacao/reenvio` | JWT, qualquer papel | 202; 409 se já confirmado; 429 no mesmo limite do "esqueci" |
+| `GET /v1/conta` | JWT, qualquer papel | inclui `emailConfirmado` |
+
+```mermaid
+sequenceDiagram
+    participant P as Pessoa
+    participant F as Frontend
+    participant PE as ms-pessoa
+    participant M as Servidor de e-mail
+    P->>F: esqueci a senha (e-mail)
+    F->>PE: POST /v1/senha/esqueci { email }
+    PE->>PE: conta ativa? grava SHA-256 do token (30 min)
+    PE-->>F: 202 (igual se o e-mail não tem conta)
+    PE-)M: depois do commit: link .../redefinir-senha#35;token=...
+    M-)P: e-mail
+    P->>F: abre o link
+    F->>PE: POST /v1/senha/redefinir { token, novaSenha }
+    PE->>PE: token válido? apaga, troca a senha, confirma o e-mail
+    PE-->>F: 204
+    F->>PE: POST /v1/auth/login (senha nova)
+```
+
+- **Confirmação do e-mail:** toda conta nova (cadastro do paciente e, pela rota interna, do nutricionista) recebe o link de confirmação; a conta que só ganha um papel novo não recebe outro. Redefinir a senha pelo link também confirma o e-mail, porque prova que a pessoa o lê.
+- **O login não exige o e-mail confirmado (v1).** O nutricionista entra logo depois do cadastro (o fluxo do frontend termina no login), e um ambiente com o envio fora do ar não deixaria ninguém novo entrar. O frontend usa `emailConfirmado` para lembrar a pessoa e oferecer o reenvio; exigir a confirmação depois é só uma verificação no login.
+- **Depois da redefinição:** a senha antiga deixa de valer, os outros links de redefinição da conta também, e o bloqueio por senhas erradas é liberado. JWTs já emitidos continuam valendo até expirar (15 min; sem refresh token não há sessão para derrubar).
+- **Conta inativa ou bloqueada** não recebe o link, e a resposta continua 202.
+- **Falha no envio:** vai para o log (sem o texto, que tem o link) e não há nova tentativa; a pessoa pede outro link.
+- **Trilha:** os pedidos entram na trilha como qualquer rota `/v1/**`, ligados à conta (e ao nutricionista, se for o caso). O pedido de "esqueci a senha" não tem autor (qualquer um pode pedir); a redefinição e a confirmação têm, porque quem usou o link é o dono. Token, e-mail e senha nunca são registrados.
 
 ### Assinatura da plataforma
 
@@ -264,7 +339,7 @@ Todos os serviços registram **quem fez o quê** e publicam em `auditoria.regist
 - **Automática (`core-auditoria`):** cada requisição `/v1/**` que chega a um controller gera um registro com método, padrão da rota (`/v1/consultas/{id}/status`), variáveis da rota, status da resposta, usuário, papel, tenant e IP. O recurso é a raiz do agregado na rota (`consultas`) e o id vem da rota ou da resposta; o paciente vem de `pacienteId` na rota ou na resposta.
 - **Leituras de prontuário:** `afitcenter.auditoria.leituras=true` no ms-paciente, ms-consulta, ms-avaliacao e ms-dieta registra também os `GET` (LGPD: quem acessou os dados de saúde de um paciente). Catálogos sem dado pessoal (alimentos, métricas, condições) ficam de fora.
 - **Ações do sistema:** renovação, inadimplência, pagamento confirmado e mudanças de cobrança são registradas pelo próprio serviço (`Auditoria.registrarSistema`), na mesma transação da mudança.
-- **Sem dados pessoais:** corpo e query string nunca entram no registro (podem ter nome, CPF ou conteúdo clínico); login registra o usuário, nunca o e-mail.
+- **Sem dados pessoais:** corpo e query string nunca entram no registro (podem ter nome, CPF ou conteúdo clínico); login registra o usuário, nunca o e-mail. Os tokens dos links por e-mail vão no corpo, então também ficam de fora.
 - **Entrega:** o registro vai para a outbox numa transação própria logo depois da resposta. A outbox apaga os eventos já publicados depois de 7 dias (`afitcenter.outbox.retencao-horas`).
 - **Guarda:** o id do registro é o id do evento (reentrega não duplica). Um gatilho do banco recusa `UPDATE`, `DELETE` e `TRUNCATE`; só a retenção diária apaga registros mais antigos que `AUDITORIA_RETENCAO_DIAS` (padrão 5 anos).
 - **Consulta:** o nutricionista vê o próprio tenant em `/ms-auditoria/v1/auditoria/registros` (filtro `pacienteId` responde "quem acessou este paciente"; o IP só aparece nos registros feitos por ele). O administrador vê todos em `/v1/admin/auditoria/registros`, e cada consulta dele também entra na trilha.
@@ -306,4 +381,6 @@ O [MER](MER.md) continua sendo o modelo lógico. Na divisão física por serviç
 | Importar a TACO/TBCA como migração do catálogo de alimentos | ms-dieta |
 | Armazenamento dos anexos de exame (MinIO/S3 com URL assinada) | ms-avaliacao + Compose |
 | Valores de %VD dos nutrientes (IN ANVISA nº 75/2020) | ms-dieta |
+| Troca do e-mail da conta (com confirmação do endereço novo), novas tentativas no envio de e-mail e e-mail em HTML | ms-pessoa |
+| Telas do portal do paciente (dieta, evolução, consultas) e nome do nutricionista em cada ficha | ms-paciente, ms-dieta, ms-avaliacao, ms-consulta |
 | Refresh token, limite de requisições no Gateway, rastreamento distribuído, CI | transversal |

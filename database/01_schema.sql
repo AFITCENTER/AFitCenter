@@ -9,8 +9,11 @@
 --     carregam nutricionista_id. Tabelas de detalhe herdam o dono pelo pai.
 --     FKs compostas garantem que consulta/avaliação/dieta/exame apontem
 --     para um paciente do MESMO nutricionista.
---   * Paciente ainda não acessa o sistema, mas paciente.usuario_id já existe:
---     no futuro, um único login de paciente enxerga todas as suas fichas.
+--   * Pessoa é quem acessa: nome, CPF, e-mail (login), senha e um ou mais papéis.
+--     O nutricionista é o perfil profissional da pessoa (mesmo id). O paciente
+--     cria a própria conta e liga as fichas com o código de acesso que o
+--     nutricionista gera: um login enxerga todas as fichas dele, uma por
+--     nutricionista (paciente.pessoa_id).
 --   * Estudante fica fora da v1.
 --   * Dados clínicos usam exclusão lógica (deletado_em): prontuário não se apaga.
 --   * IDs: uuid para dados de negócio, integer identity para catálogos.
@@ -30,28 +33,51 @@ END $$;
 -- ---------------------------------------------------------------------
 -- 1. Acesso
 -- ---------------------------------------------------------------------
-CREATE TABLE usuario (
+CREATE TABLE pessoa (
   id             uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  email          text NOT NULL,
+  nome           text NOT NULL,
+  cpf            char(11),                            -- opcional para paciente; o nutricionista informa no cadastro
+  email          text NOT NULL,                       -- login
+  email_confirmado_em timestamptz,                    -- quando abriu um link enviado ao e-mail; o login não exige
+  telefone       text,
   senha_hash     text NOT NULL,                       -- bcrypt/argon2, nunca a senha
-  perfil         text NOT NULL CHECK (perfil IN ('NUTRICIONISTA', 'PACIENTE', 'ADMIN')),
   status         text NOT NULL DEFAULT 'ATIVO' CHECK (status IN ('ATIVO', 'BLOQUEADO', 'INATIVO')),
   ultimo_acesso  timestamptz,
   criado_em      timestamptz NOT NULL DEFAULT now(),
   atualizado_em  timestamptz NOT NULL DEFAULT now()
 );
-CREATE UNIQUE INDEX ux_usuario_email ON usuario (lower(email));
+CREATE UNIQUE INDEX ux_pessoa_email ON pessoa (lower(email));
+CREATE UNIQUE INDEX ux_pessoa_cpf ON pessoa (cpf) WHERE cpf IS NOT NULL;   -- uma conta por pessoa
+
+-- Uma pessoa pode ter vários papéis (a nutricionista que também é paciente de um colega)
+CREATE TABLE pessoa_papel (
+  pessoa_id  uuid NOT NULL REFERENCES pessoa (id) ON DELETE CASCADE,
+  papel      text NOT NULL CHECK (papel IN ('NUTRICIONISTA', 'PACIENTE', 'ADMIN')),
+  PRIMARY KEY (pessoa_id, papel)
+);
 
 -- LGPD: registro de aceite de termos e política de privacidade
 CREATE TABLE aceite_termo (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  usuario_id  uuid NOT NULL REFERENCES usuario (id),
+  pessoa_id   uuid NOT NULL REFERENCES pessoa (id),
   tipo        text NOT NULL CHECK (tipo IN ('TERMOS_DE_USO', 'POLITICA_PRIVACIDADE')),
   versao      text NOT NULL,
   aceito_em   timestamptz NOT NULL DEFAULT now(),
   ip          inet,
-  UNIQUE (usuario_id, tipo, versao)
+  UNIQUE (pessoa_id, tipo, versao)
 );
+
+-- Links enviados por e-mail: redefinição de senha (30 min) e confirmação do e-mail (48 h).
+-- Uso único; pedir outro substitui o anterior. Só o hash é guardado.
+CREATE TABLE token_email (
+  id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  pessoa_id   uuid NOT NULL REFERENCES pessoa (id) ON DELETE CASCADE,
+  finalidade  text NOT NULL CHECK (finalidade IN ('REDEFINICAO_SENHA', 'CONFIRMACAO_EMAIL')),
+  token_hash  text NOT NULL UNIQUE,                    -- SHA-256 do token, nunca o token
+  expira_em   timestamptz NOT NULL,
+  criado_em   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX ix_token_email_pessoa ON token_email (pessoa_id, finalidade);
 
 -- ---------------------------------------------------------------------
 -- 2. Cadastro do nutricionista (requisito 7)
@@ -69,17 +95,15 @@ CREATE TABLE endereco (
   atualizado_em  timestamptz NOT NULL DEFAULT now()
 );
 
+-- Perfil profissional. Nome, CPF, e-mail e telefone ficam na pessoa (mesmo id).
 CREATE TABLE nutricionista (
-  id               uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  usuario_id       uuid NOT NULL UNIQUE REFERENCES usuario (id),
-  nome             text NOT NULL,
-  cpf              char(11) NOT NULL UNIQUE,
+  id               uuid PRIMARY KEY REFERENCES pessoa (id),
   crn_regiao       smallint NOT NULL CHECK (crn_regiao > 0),  -- CRN-3 → 3
   crn_numero       text NOT NULL,
   especialidades   text,
   assinatura_url   text,                                      -- usada no PDF da dieta
   logo_url         text,
-  endereco_id      uuid REFERENCES endereco (id),
+  endereco_id      uuid REFERENCES endereco (id),          -- endereço profissional
   criado_em        timestamptz NOT NULL DEFAULT now(),
   atualizado_em    timestamptz NOT NULL DEFAULT now(),
   UNIQUE (crn_regiao, crn_numero)
@@ -102,7 +126,8 @@ CREATE TABLE consultorio (
 CREATE TABLE paciente (
   id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   nutricionista_id  uuid NOT NULL REFERENCES nutricionista (id),
-  usuario_id        uuid REFERENCES usuario (id),             -- futuro portal do paciente
+  pessoa_id         uuid REFERENCES pessoa (id),              -- conta do paciente no portal; NULL = sem acesso
+  pessoa_vinculada_em timestamptz,
   nome              text NOT NULL,
   nome_social       text,
   cpf               char(11),                                 -- opcional (ex.: crianças)
@@ -123,7 +148,19 @@ CREATE TABLE paciente (
 CREATE UNIQUE INDEX ux_paciente_cpf_por_nutricionista
   ON paciente (nutricionista_id, cpf) WHERE cpf IS NOT NULL AND deletado_em IS NULL;
 CREATE INDEX ix_paciente_nutricionista_nome ON paciente (nutricionista_id, nome);
-CREATE INDEX ix_paciente_usuario ON paciente (usuario_id) WHERE usuario_id IS NOT NULL;
+-- Uma conta tem no máximo uma ficha ativa por nutricionista
+CREATE UNIQUE INDEX ux_paciente_pessoa_por_nutricionista
+  ON paciente (nutricionista_id, pessoa_id) WHERE pessoa_id IS NOT NULL AND deletado_em IS NULL;
+CREATE INDEX ix_paciente_pessoa ON paciente (pessoa_id) WHERE pessoa_id IS NOT NULL AND deletado_em IS NULL;
+
+-- Código que o nutricionista entrega ao paciente para ligar a ficha à conta dele.
+-- Um por ficha, de uso único e com validade; só o hash é guardado.
+CREATE TABLE codigo_acesso (
+  paciente_id  uuid PRIMARY KEY REFERENCES paciente (id) ON DELETE CASCADE,
+  codigo_hash  text NOT NULL UNIQUE,                          -- SHA-256 do código
+  expira_em    timestamptz NOT NULL,
+  criado_em    timestamptz NOT NULL DEFAULT now()
+);
 
 -- Contato pertence a exatamente um dono (nutricionista, paciente ou consultório)
 CREATE TABLE contato (
